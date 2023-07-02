@@ -1,6 +1,8 @@
 syntax = "proto3";
 
-package rannift;
+package ranniftpb;
+
+option go_package = "./;ranniftpb";
 
 service RanniftService {
     rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse) {}
