@@ -27,10 +27,9 @@ type RanniNodeConfig struct {
 	Peers []string `yaml:"peers"`
 	// Index of current node in peers
 	NodeIndex int `yaml:"node_index"`
-	// Election timeout
-	ElectionTimeout int `yaml:"election_timeout"`
-	// Election float range
-	ElectionFloatRange int `yaml:"election_float_range"`
+	// Election timeout range
+	MinElectionTimeout int `yaml:"min_election_timeout"`
+	MaxElectionTimeout int `yaml:"max_election_timeout"`
 	// Heartbeat interval
 	HeartbeatInterval int `yaml:"heartbeat_interval"`
 }
@@ -65,39 +64,32 @@ type RanniNode struct {
 	// Peers' addresses
 	peers []string
 	// Index of current node in peers
-	nodeIndex int
+	nodeIndex int32
 
+	// Election timeout range
+	minElectionTimeout int
+	maxElectionTimeout int
 	// Election timer
 	electionTimer *time.Ticker
 
+	// Heartbeat interval
+	heartbeatInterval int
 	// Heartbeat timer
 	heartbeatTimer *time.Ticker
 
+	// Random number generator
+	rand *rand.Rand
+
+	// Votes count and votes needed for election
+	votesCount  int32
+	votesNeeded int32
+
+	// TODO: Use finer-grained locking
 	// Mutex for locking
 	mu sync.Mutex
-}
 
-// RequestVote is the RPC handler for RequestVote RPC.
-func (rn *RanniNode) RequestVote(context.Context, *ranniftpb.RequestVoteRequest) (*ranniftpb.RequestVoteResponse, error) {
-	resp := &ranniftpb.RequestVoteResponse{
-		Term:        rn.currentTerm,
-		VoteGranted: true,
-	}
-	return resp, nil
-}
-
-// AppendEntries is the RPC handler for AppendEntries RPC.
-func (rn *RanniNode) AppendEntries(_ context.Context, req *ranniftpb.AppendEntriesRequest) (*ranniftpb.AppendEntriesResponse, error) {
-	if req == nil { // If request is nil, which means it's a heartbeat, reset election timer
-		rn.ResetElectionTimer()
-		return nil, nil
-	}
-
-	resp := &ranniftpb.AppendEntriesResponse{
-		Term:    rn.currentTerm,
-		Success: true,
-	}
-	return resp, nil
+	// Stop channel
+	stopCh chan struct{}
 }
 
 // NewRanniNode creates a new RanniNode.
@@ -128,70 +120,192 @@ func NewRanniNode(rnCfg *RanniNodeConfig) (*RanniNode, error) {
 
 	// Initialize RanniNode
 	rn := &RanniNode{
-		log:            logger,
-		conns:          conns,
-		currentTerm:    0,
-		votedFor:       0,
-		logs:           []*ranniftpb.LogEntry{},
-		commitIndex:    0,
-		lastApplied:    0,
-		nextIndex:      nextIndex,
-		matchIndex:     matchIndex,
-		state:          0,
-		peers:          rnCfg.Peers,
-		nodeIndex:      rnCfg.NodeIndex,
-		electionTimer:  time.NewTicker(time.Millisecond * time.Duration(rnCfg.ElectionTimeout+rand.Intn(rnCfg.ElectionFloatRange))),
-		heartbeatTimer: time.NewTicker(time.Millisecond * time.Duration(rnCfg.HeartbeatInterval)),
+		log:                logger,
+		conns:              conns,
+		currentTerm:        0,
+		votedFor:           -1,
+		logs:               []*ranniftpb.LogEntry{},
+		commitIndex:        0,
+		lastApplied:        0,
+		nextIndex:          nextIndex,
+		matchIndex:         matchIndex,
+		state:              Follower,
+		peers:              rnCfg.Peers,
+		nodeIndex:          int32(rnCfg.NodeIndex),
+		minElectionTimeout: rnCfg.MinElectionTimeout,
+		maxElectionTimeout: rnCfg.MaxElectionTimeout,
+		electionTimer:      time.NewTicker(time.Millisecond * time.Duration(rand.Intn(rnCfg.MaxElectionTimeout-rnCfg.MinElectionTimeout)+rnCfg.MinElectionTimeout)),
+		heartbeatInterval:  rnCfg.HeartbeatInterval,
+		heartbeatTimer:     time.NewTicker(time.Millisecond * time.Duration(rnCfg.HeartbeatInterval)),
+		rand:               rand.New(rand.NewSource(time.Now().UnixNano())),
+		votesCount:         0,
+		votesNeeded:        int32(len(rnCfg.Peers)/2 + 1),
+		mu:                 sync.Mutex{},
+		stopCh:             make(chan struct{}),
 	}
 	return rn, nil
 }
 
+// RequestVote is the RPC handler for RequestVote RPC.
+func (rn *RanniNode) RequestVote(_ context.Context, req *ranniftpb.RequestVoteRequest) (*ranniftpb.RequestVoteResponse, error) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	resp := &ranniftpb.RequestVoteResponse{}
+	if req.Term < rn.currentTerm { // Reject if candidate's term is smaller than current term
+		resp.VoteGranted = false
+	} else if rn.votedFor != -1 && rn.votedFor != req.CandidateId { // Reject if already voted for another candidate
+		resp.VoteGranted = false
+	} else if rn.lastApplied > req.LastLogIndex { // Reject if candidate's log is not up-to-date
+		resp.VoteGranted = false
+	} else if rn.lastApplied == req.LastLogIndex && rn.logs[rn.lastApplied].Term > req.LastLogTerm {
+		resp.VoteGranted = false
+	} else { // Grant vote in other cases
+		resp.VoteGranted = true
+		rn.currentTerm = req.Term
+		rn.votedFor = req.CandidateId
+		rn.ResetElectionTimer()
+	}
+	resp.Term = rn.currentTerm
+	return resp, nil
+}
+
+// AppendEntries is the RPC handler for AppendEntries RPC.
+func (rn *RanniNode) AppendEntries(_ context.Context, req *ranniftpb.AppendEntriesRequest) (*ranniftpb.AppendEntriesResponse, error) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	if req == nil { // If request is nil, which means it's a heartbeat, reset election timer
+		rn.ResetElectionTimer()
+		return nil, nil
+	}
+	// TODO: Implement AppendEntries
+	resp := &ranniftpb.AppendEntriesResponse{
+		Term:    rn.currentTerm,
+		Success: true,
+	}
+	return resp, nil
+}
+
 // Heartbeat sends heartbeat to all peers to maintain leadership.
 func (rn *RanniNode) Heartbeat() {
-	select {
-	case <-rn.heartbeatTimer.C: // If heartbeat timer expires, send heartbeat
-		if rn.state != Leader { // Only leader can send heartbeat
+	for {
+		select {
+		case <-rn.heartbeatTimer.C: // If heartbeat timer expires, send heartbeat
+			if rn.state != Leader { // Only leader can send heartbeat
+				return
+			}
+			rn.broadcastHeartBeat()
+		case <-rn.stopCh: // If stopCh is closed, stop heartbeat
 			return
 		}
-
-		// wg is used to wait for all goroutines to finish
-		var wg sync.WaitGroup
-		// Send heartbeat to all peers
-		for i := range rn.peers {
-			if i == rn.nodeIndex { // Skip current node
-				continue
-			}
-			wg.Add(1)
-			go func(connIndex int) { // Send heartbeat to peers concurrently
-				defer wg.Done()
-				// Initialize gRPC client
-				c := ranniftpb.NewRanniftServiceClient(rn.conns[connIndex])
-				// Set timeout to 50ms
-				ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*50)
-				defer cancel()
-				// Send nil request to indicate heartbeat
-				c.AppendEntries(ctx, nil)
-			}(i)
-		}
-		wg.Wait()
 	}
 }
 
-// TODO: Implement election.
+// broadcastHeartBeat sends heartbeat to all peers.
+func (rn *RanniNode) broadcastHeartBeat() {
+	// wg is used to wait for all goroutines to finish
+	var wg sync.WaitGroup
+	// Send heartbeat to all peers
+	for i := range rn.peers {
+		if i == int(rn.nodeIndex) { // Skip current node
+			continue
+		}
+		wg.Add(1)
+		go func(connIndex int) { // Send heartbeat to peers concurrently
+			defer wg.Done()
+			// Initialize gRPC client
+			c := ranniftpb.NewRanniftServiceClient(rn.conns[connIndex])
+			// Set timeout to heartbeat interval
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(rn.heartbeatInterval))
+			defer cancel()
+			// Send nil request to indicate heartbeat
+			_, err := c.AppendEntries(ctx, nil)
+			if err != nil {
+				rn.log.Error("failed to send heartbeat", zap.Error(err))
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
 // Election starts election if election timer expires.
 func (rn *RanniNode) Election() {
-	select {
-	case <-rn.electionTimer.C: // If election timer expires, start election
-		rn.log.Info("election timer expires, start election")
+	for {
+		select {
+		case <-rn.electionTimer.C: // If election timer expires, start election
+			rn.log.Info("election timer expires, start election")
+			rn.startElection()
+		case <-rn.stopCh: // If stopCh is closed, stop election
+			return
+		}
 	}
 }
 
-// ResetElectionTimer resets election timer to a random time between 150ms and 300ms.
+// startElection starts election.
+func (rn *RanniNode) startElection() {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	if rn.state == Leader { // If current node is leader, reset election timer
+		rn.ResetElectionTimer()
+		return
+	}
+	// If current node is not leader, start election
+	rn.state = Candidate       // Convert state to candidate
+	rn.currentTerm++           // Increment current term
+	rn.votedFor = rn.nodeIndex // Vote for self
+	rn.ResetElectionTimer()    // Reset election timer
+
+	rn.votesCount = 1 // Vote for self
+	// Send RequestVote RPC to all peers
+	for i := range rn.peers {
+		if i == int(rn.nodeIndex) { // Skip current node
+			continue
+		}
+		go func(connIndex int) { // Send RequestVote RPC to peers concurrently
+			// Initialize gRPC client
+			c := ranniftpb.NewRanniftServiceClient(rn.conns[connIndex])
+			// Set timeout to heartbeat interval
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(rn.heartbeatInterval))
+			defer cancel()
+
+			rn.mu.Lock() // Lock before sending RequestVote RPC
+			req := &ranniftpb.RequestVoteRequest{
+				Term:         rn.currentTerm,
+				CandidateId:  rn.nodeIndex,
+				LastLogIndex: rn.lastApplied,
+				LastLogTerm:  rn.logs[rn.lastApplied].Term,
+			}
+			rn.mu.Unlock() // Unlock after sending RequestVote RPC
+			// Send RequestVote RPC to peer
+			resp, err := c.RequestVote(ctx, req)
+			if err != nil { // If error occurs, return
+				rn.log.Error("failed to send RequestVote RPC", zap.Error(err))
+				return
+			}
+			if resp.VoteGranted { // If vote is granted, increment votesCount
+				rn.mu.Lock() // Lock before incrementing votesCount and checking state
+				rn.votesCount++
+				if rn.votesCount > rn.votesNeeded && rn.state == Candidate { // If votesCount > votesNeeded, become leader
+					rn.state = Leader
+					rn.mu.Unlock() // Unlock before calling broadcastHeartBeat to avoid deadlock
+					rn.log.Info("become leader")
+					rn.ResetElectionTimer()
+					rn.broadcastHeartBeat()
+					return
+				}
+				rn.mu.Unlock()
+			}
+		}(i)
+	}
+}
+
+// ResetElectionTimer resets election timer to a random time between minElectionTimeout and maxElectionTimeout.
 func (rn *RanniNode) ResetElectionTimer() {
-	// Generate a random number generator, make sure it's not the same every time
-	randGen := rand.New(rand.NewSource(time.Now().UnixNano()))
-	// Generate a random time between 150ms and 300ms
-	electTime := randGen.Intn(150) + 150
+	// Set random seed
+	rn.rand.Seed(time.Now().UnixNano())
+	// Generate a random time between minElectionTimeout and maxElectionTimeout
+	electTime := rn.rand.Intn(rn.maxElectionTimeout-rn.minElectionTimeout) + rn.minElectionTimeout
 	rn.electionTimer.Reset(time.Millisecond * time.Duration(electTime))
 }
 
@@ -199,4 +313,17 @@ func (rn *RanniNode) ResetElectionTimer() {
 func (rn *RanniNode) Run() {
 	go rn.Heartbeat()
 	go rn.Election()
+}
+
+// Close closes the RanniNode.
+func (rn *RanniNode) Close() {
+	rn.electionTimer.Stop()
+	rn.heartbeatTimer.Stop()
+	rn.stopCh <- struct{}{}
+	for _, conn := range rn.conns {
+		err := conn.Close()
+		if err != nil {
+			rn.log.Error("failed to close connection", zap.Error(err))
+		}
+	}
 }
