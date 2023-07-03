@@ -11,9 +11,6 @@ import (
 	"time"
 )
 
-// NodeState is the type for RanniNode state.
-type NodeState int
-
 // Timeout constants.
 const (
 	// Election timeout range
@@ -22,6 +19,9 @@ const (
 	// Heartbeat interval
 	heartbeatInterval = 50
 )
+
+// NodeState is the type for RanniNode state.
+type NodeState int
 
 // NodeState constants.
 const (
@@ -172,31 +172,34 @@ func (rn *RanniNode) Heartbeat() {
 		if rn.state != Leader { // Only leader can send heartbeat
 			return
 		}
-
-		// wg is used to wait for all goroutines to finish
-		var wg sync.WaitGroup
-		// Send heartbeat to all peers
-		for i := range rn.peers {
-			if i == int(rn.nodeIndex) { // Skip current node
-				continue
-			}
-			wg.Add(1)
-			go func(connIndex int) { // Send heartbeat to peers concurrently
-				defer wg.Done()
-				// Initialize gRPC client
-				c := ranniftpb.NewRanniftServiceClient(rn.conns[connIndex])
-				// Set timeout to 50ms
-				ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*heartbeatInterval)
-				defer cancel()
-				// Send nil request to indicate heartbeat
-				c.AppendEntries(ctx, nil)
-			}(i)
-		}
-		wg.Wait()
+		rn.broadcastHeartBeat()
 	}
 }
 
-// TODO: Complete election.
+// broadcastHeartBeat sends heartbeat to all peers.
+func (rn *RanniNode) broadcastHeartBeat() {
+	// wg is used to wait for all goroutines to finish
+	var wg sync.WaitGroup
+	// Send heartbeat to all peers
+	for i := range rn.peers {
+		if i == int(rn.nodeIndex) { // Skip current node
+			continue
+		}
+		wg.Add(1)
+		go func(connIndex int) { // Send heartbeat to peers concurrently
+			defer wg.Done()
+			// Initialize gRPC client
+			c := ranniftpb.NewRanniftServiceClient(rn.conns[connIndex])
+			// Set timeout to 50ms
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*heartbeatInterval)
+			defer cancel()
+			// Send nil request to indicate heartbeat
+			c.AppendEntries(ctx, nil)
+		}(i)
+	}
+	wg.Wait()
+}
+
 // Election starts election if election timer expires.
 func (rn *RanniNode) Election() {
 	select {
@@ -209,12 +212,57 @@ func (rn *RanniNode) Election() {
 			return
 		}
 		// If current node is not leader, start election
-		rn.state = Candidate
-		rn.currentTerm++
-		rn.votedFor = rn.nodeIndex
-		// TODO: Send RequestVote RPC to all peers and count votes, if votes > n/2, become leader
-		rn.ResetElectionTimer()
+		rn.state = Candidate       // Convert state to candidate
+		rn.currentTerm++           // Increment current term
+		rn.votedFor = rn.nodeIndex // Vote for self
+		rn.ResetElectionTimer()    // Reset election timer
 		rn.mu.Unlock()
+
+		votesCount := 1                        // Vote for self
+		votesNeeded := (len(rn.peers) + 1) / 2 // n/2 votes needed to become leader
+		for i := range rn.peers {
+			if i == int(rn.nodeIndex) { // Skip current node
+				continue
+			}
+			go func(connIndex int) { // Send RequestVote RPC to peers concurrently
+				rn.mu.Lock()
+				defer rn.mu.Unlock()
+
+				// Initialize gRPC client
+				c := ranniftpb.NewRanniftServiceClient(rn.conns[connIndex])
+				// Set timeout to 50ms
+				ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*heartbeatInterval)
+				defer cancel()
+				// Send RequestVote RPC to peer
+				resp, err := c.RequestVote(ctx, &ranniftpb.RequestVoteRequest{
+					Term:         rn.currentTerm,
+					CandidateId:  rn.nodeIndex,
+					LastLogIndex: rn.lastApplied,
+					LastLogTerm:  rn.logs[rn.lastApplied].Term,
+				})
+				if err != nil {
+					rn.log.Error("failed to send RequestVote RPC", zap.Error(err))
+					return
+				}
+
+				// Lock before updating state
+				rn.mu.Lock()
+				defer rn.mu.Unlock()
+				if rn.state != Candidate { // If current node is not candidate, return
+					return
+				}
+				if resp.VoteGranted { // If vote is granted, increment votesCount
+					votesCount++
+					if votesCount > votesNeeded && rn.state == Candidate { // If votesCount > votesNeeded, become leader
+						rn.state = Leader
+						rn.log.Info("become leader")
+						rn.ResetElectionTimer()
+						rn.broadcastHeartBeat()
+						return
+					}
+				}
+			}(i)
+		}
 	}
 }
 
